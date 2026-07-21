@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,6 +31,8 @@ var jwtKey = func() []byte {
 	return []byte("callsync_secret_security_key_2026")
 }()
 
+// ── Models ────────────────────────────────────────────────────────────────────
+
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Username  string    `gorm:"uniqueIndex;not null" json:"username"`
@@ -43,19 +48,24 @@ type Device struct {
 }
 
 type Recording struct {
-	ID           uint      `gorm:"primaryKey" json:"id"`
-	Name         string    `gorm:"not null" json:"name"`
-	Size         int64     `gorm:"not null" json:"size"`
-	SHA256       string    `gorm:"uniqueIndex;not null" json:"sha256"`
-	Duration     float64   `json:"duration"`
-	UploadDate   time.Time `json:"upload_date"`
-	CreationDate time.Time `json:"creation_date"`
-	Path         string    `gorm:"not null" json:"path"`
-	DeviceID     string    `gorm:"not null" json:"device_id"`
-	Device       Device    `gorm:"foreignKey:DeviceID" json:"device"`
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	Name            string    `gorm:"not null" json:"name"`
+	Size            int64     `gorm:"not null" json:"size"`
+	SHA256          string    `gorm:"uniqueIndex;not null" json:"sha256"`
+	Duration        float64   `json:"duration"`
+	UploadDate      time.Time `json:"upload_date"`
+	CreationDate    time.Time `json:"creation_date"`
+	Path            string    `gorm:"not null" json:"path"`
+	DeviceID        string    `gorm:"not null" json:"device_id"`
+	Device          Device    `gorm:"foreignKey:DeviceID" json:"device"`
+	TelegramMsgID   int64     `json:"telegram_msg_id,omitempty"`
+	TelegramFileID  string    `json:"telegram_file_id,omitempty"`
+	TelegramBacked  bool      `gorm:"default:false" json:"telegram_backed"`
 }
 
 var db *gorm.DB
+
+// ── Database ──────────────────────────────────────────────────────────────────
 
 func initDB() {
 	var err error
@@ -83,6 +93,133 @@ func initDB() {
 	}
 }
 
+// ── Telegram Backup ───────────────────────────────────────────────────────────
+
+type tgSendDocumentResp struct {
+	OK     bool `json:"ok"`
+	Result struct {
+		MessageID int64 `json:"message_id"`
+		Document  struct {
+			FileID string `json:"file_id"`
+		} `json:"document"`
+		Audio struct {
+			FileID string `json:"file_id"`
+		} `json:"audio"`
+	} `json:"result"`
+}
+
+// backupToTelegram sends the audio file to a Telegram chat as a document.
+// Runs in a goroutine — never blocks the upload response.
+// Requires env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+func backupToTelegram(recording *Recording) {
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	if botToken == "" || chatID == "" {
+		return // Telegram backup not configured — silently skip
+	}
+
+	go func(rec Recording) {
+		f, err := os.Open(rec.Path)
+		if err != nil {
+			log.Printf("[Telegram backup] cannot open %s: %v", rec.Path, err)
+			return
+		}
+		defer f.Close()
+
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+
+		// chat_id
+		_ = w.WriteField("chat_id", chatID)
+		// caption with metadata
+		caption := fmt.Sprintf(
+			"📞 *%s*\n📱 Device: %s\n📅 %s\n💾 %.1f KB\n🔑 `%s`",
+			rec.Name,
+			rec.DeviceID,
+			rec.CreationDate.Format("2006-01-02 15:04"),
+			float64(rec.Size)/1024,
+			rec.SHA256[:16],
+		)
+		_ = w.WriteField("caption", caption)
+		_ = w.WriteField("parse_mode", "Markdown")
+
+		// file
+		part, err := w.CreateFormFile("document", rec.Name)
+		if err != nil {
+			log.Printf("[Telegram backup] multipart create error: %v", err)
+			return
+		}
+		if _, err = io.Copy(part, f); err != nil {
+			log.Printf("[Telegram backup] copy error: %v", err)
+			return
+		}
+		w.Close()
+
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
+		resp, err := http.Post(url, w.FormDataContentType(), &buf)
+		if err != nil {
+			log.Printf("[Telegram backup] HTTP error: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		var tgResp tgSendDocumentResp
+		if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
+			log.Printf("[Telegram backup] decode error: %v", err)
+			return
+		}
+
+		if !tgResp.OK {
+			log.Printf("[Telegram backup] Telegram API error for recording %d", rec.ID)
+			return
+		}
+
+		fileID := tgResp.Result.Document.FileID
+		if fileID == "" {
+			fileID = tgResp.Result.Audio.FileID
+		}
+
+		// Persist Telegram metadata back to DB
+		db.Model(&Recording{}).Where("id = ?", rec.ID).Updates(map[string]interface{}{
+			"telegram_msg_id":  tgResp.Result.MessageID,
+			"telegram_file_id": fileID,
+			"telegram_backed":  true,
+		})
+
+		log.Printf("[Telegram backup] ✅ Recording %d (%s) backed up — msg_id=%d",
+			rec.ID, rec.Name, tgResp.Result.MessageID)
+	}(*recording)
+}
+
+// retryTelegramBackups retries any recording that wasn't backed up yet.
+// Called at server start and every 10 minutes.
+func retryTelegramBackups() {
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	if botToken == "" || chatID == "" {
+		return
+	}
+
+	go func() {
+		// Wait a bit for the server to fully start before first retry
+		time.Sleep(30 * time.Second)
+		for {
+			var pending []Recording
+			db.Where("telegram_backed = ? OR telegram_backed IS NULL", false).Find(&pending)
+			if len(pending) > 0 {
+				log.Printf("[Telegram backup] Retrying %d un-backed recordings…", len(pending))
+				for i := range pending {
+					backupToTelegram(&pending[i])
+					time.Sleep(2 * time.Second) // Rate limit: avoid Telegram flood
+				}
+			}
+			time.Sleep(10 * time.Minute)
+		}
+	}()
+}
+
+// ── JWT ───────────────────────────────────────────────────────────────────────
+
 type Claims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
@@ -100,6 +237,8 @@ func generateToken(username string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(jwtKey)
 }
+
+// ── Middleware ────────────────────────────────────────────────────────────────
 
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -150,7 +289,8 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-// getDiskStats returns total, free, and used bytes for the storage directory
+// ── Disk stats ────────────────────────────────────────────────────────────────
+
 func getDiskStats(path string) (total, free, used uint64) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
@@ -162,7 +302,6 @@ func getDiskStats(path string) (total, free, used uint64) {
 	return
 }
 
-// storageUsedByRecordings calculates bytes used by all stored audio files
 func storageUsedByRecordings() int64 {
 	var total int64
 	filepath.Walk("storage", func(path string, info os.FileInfo, err error) error {
@@ -174,9 +313,12 @@ func storageUsedByRecordings() int64 {
 	return total
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 func main() {
 	initDB()
 	os.MkdirAll("storage", 0755)
+	retryTelegramBackups()
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -184,38 +326,47 @@ func main() {
 	r.SetTrustedProxies(nil)
 	r.Use(corsMiddleware())
 
-	// Root — API info
+	// ── Public routes ─────────────────────────────────────────────────────────
+
 	r.GET("/", func(c *gin.Context) {
+		telegramConfigured := os.Getenv("TELEGRAM_BOT_TOKEN") != "" && os.Getenv("TELEGRAM_CHAT_ID") != ""
 		c.JSON(http.StatusOK, gin.H{
-			"app":     "CallSync Server",
-			"version": "2.0.0",
-			"status":  "running",
+			"app":                "CallSync Server",
+			"version":            "2.1.0",
+			"status":             "running",
+			"telegram_backup":    telegramConfigured,
 			"endpoints": []string{
 				"GET    /health",
 				"POST   /login",
-				"POST   /upload           (Bearer token)",
-				"GET    /records          (Bearer token)",
-				"GET    /record/:id       (Bearer token)",
-				"GET    /stream/:id       (Bearer token)",
-				"GET    /download/:id     (Bearer token) — file attachment",
-				"DELETE /record/:id       (Bearer token)",
-				"DELETE /purge-all        (Bearer token) — delete all recordings",
-				"GET    /storage/stats    (Bearer token)",
+				"POST   /upload              (Bearer token)",
+				"GET    /records             (Bearer token)",
+				"GET    /record/:id          (Bearer token)",
+				"GET    /stream/:id          (Bearer token)",
+				"GET    /download/:id        (Bearer token)",
+				"DELETE /record/:id          (Bearer token)",
+				"DELETE /purge-all           (Bearer token)",
+				"GET    /storage/stats       (Bearer token)",
+				"GET    /backup/status       (Bearer token) — Telegram backup status",
+				"POST   /backup/retry        (Bearer token) — retry failed backups",
 			},
 		})
 	})
 
 	r.GET("/health", func(c *gin.Context) {
-		var recCount int64
-		var devCount int64
+		var recCount, devCount int64
+		var backedCount int64
 		db.Model(&Recording{}).Count(&recCount)
 		db.Model(&Device{}).Count(&devCount)
+		db.Model(&Recording{}).Where("telegram_backed = ?", true).Count(&backedCount)
+		telegramConfigured := os.Getenv("TELEGRAM_BOT_TOKEN") != "" && os.Getenv("TELEGRAM_CHAT_ID") != ""
 		c.JSON(http.StatusOK, gin.H{
-			"status":      "healthy",
-			"version":     "2.0.0",
-			"recordings":  recCount,
-			"devices":     devCount,
-			"server_time": time.Now().UTC().Format(time.RFC3339),
+			"status":              "healthy",
+			"version":             "2.1.0",
+			"recordings":          recCount,
+			"devices":             devCount,
+			"telegram_backup":     telegramConfigured,
+			"telegram_backed":     backedCount,
+			"server_time":         time.Now().UTC().Format(time.RFC3339),
 		})
 	})
 
@@ -248,10 +399,12 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"token": token})
 	})
 
+	// ── Authenticated routes ──────────────────────────────────────────────────
+
 	authorized := r.Group("/")
 	authorized.Use(authMiddleware())
 	{
-		// ── Upload ────────────────────────────────────────────────────────────
+		// Upload
 		authorized.POST("/upload", func(c *gin.Context) {
 			phoneID := c.PostForm("phone_id")
 			deviceName := c.PostForm("device_name")
@@ -333,15 +486,20 @@ func main() {
 				return
 			}
 
+			// Backup to Telegram asynchronously (non-blocking)
+			backupToTelegram(&recording)
+
+			telegramConfigured := os.Getenv("TELEGRAM_BOT_TOKEN") != "" && os.Getenv("TELEGRAM_CHAT_ID") != ""
 			c.JSON(http.StatusOK, gin.H{
-				"message": "Upload successful",
-				"id":      recording.ID,
-				"sha256":  computedSHA256,
-				"size":    fileHeader.Size,
+				"message":          "Upload successful",
+				"id":               recording.ID,
+				"sha256":           computedSHA256,
+				"size":             fileHeader.Size,
+				"telegram_backup":  telegramConfigured,
 			})
 		})
 
-		// ── List records ──────────────────────────────────────────────────────
+		// List records
 		authorized.GET("/records", func(c *gin.Context) {
 			var recordings []Recording
 			if err := db.Preload("Device").Order("creation_date DESC").Find(&recordings).Error; err != nil {
@@ -351,7 +509,7 @@ func main() {
 			c.JSON(http.StatusOK, recordings)
 		})
 
-		// ── Record detail ─────────────────────────────────────────────────────
+		// Record detail
 		authorized.GET("/record/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -362,7 +520,7 @@ func main() {
 			c.JSON(http.StatusOK, recording)
 		})
 
-		// ── Stream (inline playback) ───────────────────────────────────────────
+		// Stream (inline playback)
 		authorized.GET("/stream/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -398,7 +556,7 @@ func main() {
 			c.File(recording.Path)
 		})
 
-		// ── Download (attachment — for offline save on receiver) ───────────────
+		// Download (attachment)
 		authorized.GET("/download/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -417,7 +575,7 @@ func main() {
 			c.File(recording.Path)
 		})
 
-		// ── Delete single record ───────────────────────────────────────────────
+		// Delete single record
 		authorized.DELETE("/record/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -442,9 +600,7 @@ func main() {
 			})
 		})
 
-		// ── Purge ALL recordings ───────────────────────────────────────────────
-		// Deletes every recording from DB + disk. Used by receiver after
-		// confirming all files are downloaded locally.
+		// Purge ALL recordings
 		authorized.DELETE("/purge-all", func(c *gin.Context) {
 			var recordings []Recording
 			if err := db.Find(&recordings).Error; err != nil {
@@ -455,12 +611,10 @@ func main() {
 			deleted := 0
 			errors := 0
 			for _, rec := range recordings {
-				// Remove file from disk
 				if err := os.Remove(rec.Path); err != nil && !os.IsNotExist(err) {
 					log.Printf("Warning: could not remove file %s: %v", rec.Path, err)
 					errors++
 				}
-				// Delete from DB
 				if err := db.Delete(&rec).Error; err != nil {
 					log.Printf("Warning: could not delete DB record %d: %v", rec.ID, err)
 					errors++
@@ -469,7 +623,6 @@ func main() {
 				}
 			}
 
-			// Clean up empty device folders
 			filepath.Walk("storage", func(path string, info os.FileInfo, err error) error {
 				if err == nil && info.IsDir() && path != "storage" {
 					entries, _ := os.ReadDir(path)
@@ -488,28 +641,67 @@ func main() {
 			})
 		})
 
-		// ── Storage stats ─────────────────────────────────────────────────────
+		// Storage stats
 		authorized.GET("/storage/stats", func(c *gin.Context) {
-			var recCount int64
-			var totalSize int64
+			var recCount, totalSize, backedCount int64
 			db.Model(&Recording{}).Count(&recCount)
 			db.Model(&Recording{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize)
+			db.Model(&Recording{}).Where("telegram_backed = ?", true).Count(&backedCount)
 
 			diskTotal, diskFree, diskUsed := getDiskStats("storage")
 			recordingsUsed := storageUsedByRecordings()
 
 			c.JSON(http.StatusOK, gin.H{
-				"recordings":       recCount,
-				"recordings_bytes": recordingsUsed,
-				"disk_total":       diskTotal,
-				"disk_free":        diskFree,
-				"disk_used":        diskUsed,
-				"db_total_size":    totalSize,
+				"recordings":         recCount,
+				"recordings_bytes":   recordingsUsed,
+				"telegram_backed":    backedCount,
+				"telegram_pending":   recCount - backedCount,
+				"disk_total":         diskTotal,
+				"disk_free":          diskFree,
+				"disk_used":          diskUsed,
+				"db_total_size":      totalSize,
+			})
+		})
+
+		// Telegram backup status
+		authorized.GET("/backup/status", func(c *gin.Context) {
+			var total, backed, pending int64
+			db.Model(&Recording{}).Count(&total)
+			db.Model(&Recording{}).Where("telegram_backed = ?", true).Count(&backed)
+			pending = total - backed
+			telegramConfigured := os.Getenv("TELEGRAM_BOT_TOKEN") != "" && os.Getenv("TELEGRAM_CHAT_ID") != ""
+
+			c.JSON(http.StatusOK, gin.H{
+				"telegram_configured": telegramConfigured,
+				"total":               total,
+				"backed_up":           backed,
+				"pending":             pending,
+				"coverage_pct":        func() float64 {
+					if total == 0 {
+						return 100.0
+					}
+					return float64(backed) / float64(total) * 100
+				}(),
+			})
+		})
+
+		// Force retry all pending Telegram backups
+		authorized.POST("/backup/retry", func(c *gin.Context) {
+			var pending []Recording
+			db.Where("telegram_backed = ? OR telegram_backed IS NULL", false).Find(&pending)
+
+			for i := range pending {
+				backupToTelegram(&pending[i])
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":   "Retry triggered",
+				"triggered": len(pending),
 			})
 		})
 	}
 
-	// 404 handler — always JSON
+	// 404 handler
 	r.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":  "Route not found",
@@ -523,7 +715,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("CallSync server v2.0 starting on :%s", port)
+	log.Printf("CallSync server v2.1 starting on :%s", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
