@@ -30,3 +30,7 @@ outputType = "console"
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[deployment]
+deploymentTarget = "vm"
+run = ["sh", "-c", "cd callsync-server && go build -o callsync_server . && ./callsync_server"]
