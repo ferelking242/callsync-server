@@ -21,7 +21,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "./callsync_server"
+args = "go build -o callsync_server . && ./callsync_server"
 waitForPort = 8080
 
 [workflows.workflow.metadata]
