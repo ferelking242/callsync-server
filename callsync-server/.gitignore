@@ -1,0 +1,5 @@
+callsync_server
+callsync.db
+storage/
+*.db-shm
+*.db-wal
