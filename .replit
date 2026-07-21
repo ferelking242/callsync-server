@@ -19,18 +19,18 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "go build -o callsync_server . && ./callsync_server"
-waitForPort = 8080
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd callsync-server && go build -mod=vendor -o callsync_server . && ./callsync_server"
+waitForPort = 8080
 
 [[ports]]
 localPort = 8080
 externalPort = 80
 
 [deployment]
-deploymentTarget = "vm"
+deploymentTarget = "cloudrun"
 run = ["sh", "-c", "cd callsync-server && go build -o callsync_server . && ./callsync_server"]
