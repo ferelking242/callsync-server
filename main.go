@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -82,7 +84,7 @@ type Claims struct {
 }
 
 func generateToken(username string) (string, error) {
-	expirationTime := time.Now().Add(24 * time.Hour)
+	expirationTime := time.Now().Add(72 * time.Hour)
 	claims := &Claims{
 		Username: username,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -143,6 +145,30 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// getDiskStats returns total, free, and used bytes for the storage directory
+func getDiskStats(path string) (total, free, used uint64) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, 0, 0
+	}
+	total = stat.Blocks * uint64(stat.Bsize)
+	free = stat.Bfree * uint64(stat.Bsize)
+	used = total - free
+	return
+}
+
+// storageUsedByRecordings calculates bytes used by all stored audio files
+func storageUsedByRecordings() int64 {
+	var total int64
+	filepath.Walk("storage", func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
 func main() {
 	initDB()
 	os.MkdirAll("storage", 0755)
@@ -153,19 +179,23 @@ func main() {
 	r.SetTrustedProxies(nil)
 	r.Use(corsMiddleware())
 
-	// Root — API info (browser-friendly, no more red 404)
+	// Root — API info
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"app":     "CallSync Server",
-			"version": "1.0.0",
+			"version": "2.0.0",
 			"status":  "running",
 			"endpoints": []string{
-				"GET  /health",
-				"POST /login",
-				"POST /upload        (Bearer token)",
-				"GET  /records       (Bearer token)",
-				"GET  /stream/:id    (Bearer token)",
-				"DELETE /record/:id  (Bearer token)",
+				"GET    /health",
+				"POST   /login",
+				"POST   /upload           (Bearer token)",
+				"GET    /records          (Bearer token)",
+				"GET    /record/:id       (Bearer token)",
+				"GET    /stream/:id       (Bearer token)",
+				"GET    /download/:id     (Bearer token) — file attachment",
+				"DELETE /record/:id       (Bearer token)",
+				"DELETE /purge-all        (Bearer token) — delete all recordings",
+				"GET    /storage/stats    (Bearer token)",
 			},
 		})
 	})
@@ -177,7 +207,7 @@ func main() {
 		db.Model(&Device{}).Count(&devCount)
 		c.JSON(http.StatusOK, gin.H{
 			"status":      "healthy",
-			"version":     "1.0.0",
+			"version":     "2.0.0",
 			"recordings":  recCount,
 			"devices":     devCount,
 			"server_time": time.Now().UTC().Format(time.RFC3339),
@@ -216,6 +246,7 @@ func main() {
 	authorized := r.Group("/")
 	authorized.Use(authMiddleware())
 	{
+		// ── Upload ────────────────────────────────────────────────────────────
 		authorized.POST("/upload", func(c *gin.Context) {
 			phoneID := c.PostForm("phone_id")
 			deviceName := c.PostForm("device_name")
@@ -230,7 +261,7 @@ func main() {
 
 			fileHeader, err := c.FormFile("file")
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded — include a 'file' field in multipart form"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
 				return
 			}
 
@@ -305,6 +336,7 @@ func main() {
 			})
 		})
 
+		// ── List records ──────────────────────────────────────────────────────
 		authorized.GET("/records", func(c *gin.Context) {
 			var recordings []Recording
 			if err := db.Preload("Device").Order("creation_date DESC").Find(&recordings).Error; err != nil {
@@ -314,6 +346,18 @@ func main() {
 			c.JSON(http.StatusOK, recordings)
 		})
 
+		// ── Record detail ─────────────────────────────────────────────────────
+		authorized.GET("/record/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			var recording Recording
+			if err := db.Preload("Device").First(&recording, id).Error; err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found", "id": id})
+				return
+			}
+			c.JSON(http.StatusOK, recording)
+		})
+
+		// ── Stream (inline playback) ───────────────────────────────────────────
 		authorized.GET("/stream/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -323,7 +367,7 @@ func main() {
 			}
 
 			if _, err := os.Stat(recording.Path); os.IsNotExist(err) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Audio file missing from disk", "path": recording.Path})
+				c.JSON(http.StatusNotFound, gin.H{"error": "Audio file missing from disk"})
 				return
 			}
 
@@ -340,6 +384,8 @@ func main() {
 				contentType = "audio/amr"
 			case ".3gp":
 				contentType = "video/3gpp"
+			case ".aac":
+				contentType = "audio/aac"
 			}
 
 			c.Header("Content-Type", contentType)
@@ -347,6 +393,26 @@ func main() {
 			c.File(recording.Path)
 		})
 
+		// ── Download (attachment — for offline save on receiver) ───────────────
+		authorized.GET("/download/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			var recording Recording
+			if err := db.First(&recording, id).Error; err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found", "id": id})
+				return
+			}
+
+			if _, err := os.Stat(recording.Path); os.IsNotExist(err) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Audio file missing from disk"})
+				return
+			}
+
+			c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, recording.Name))
+			c.Header("Content-Transfer-Encoding", "binary")
+			c.File(recording.Path)
+		})
+
+		// ── Delete single record ───────────────────────────────────────────────
 		authorized.DELETE("/record/:id", func(c *gin.Context) {
 			id := c.Param("id")
 			var recording Recording
@@ -370,6 +436,72 @@ func main() {
 				"name":    recording.Name,
 			})
 		})
+
+		// ── Purge ALL recordings ───────────────────────────────────────────────
+		// Deletes every recording from DB + disk. Used by receiver after
+		// confirming all files are downloaded locally.
+		authorized.DELETE("/purge-all", func(c *gin.Context) {
+			var recordings []Recording
+			if err := db.Find(&recordings).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recordings for purge"})
+				return
+			}
+
+			deleted := 0
+			errors := 0
+			for _, rec := range recordings {
+				// Remove file from disk
+				if err := os.Remove(rec.Path); err != nil && !os.IsNotExist(err) {
+					log.Printf("Warning: could not remove file %s: %v", rec.Path, err)
+					errors++
+				}
+				// Delete from DB
+				if err := db.Delete(&rec).Error; err != nil {
+					log.Printf("Warning: could not delete DB record %d: %v", rec.ID, err)
+					errors++
+				} else {
+					deleted++
+				}
+			}
+
+			// Clean up empty device folders
+			filepath.Walk("storage", func(path string, info os.FileInfo, err error) error {
+				if err == nil && info.IsDir() && path != "storage" {
+					entries, _ := os.ReadDir(path)
+					if len(entries) == 0 {
+						os.Remove(path)
+					}
+				}
+				return nil
+			})
+
+			c.JSON(http.StatusOK, gin.H{
+				"message": "Purge complete",
+				"deleted": deleted,
+				"errors":  errors,
+				"total":   len(recordings),
+			})
+		})
+
+		// ── Storage stats ─────────────────────────────────────────────────────
+		authorized.GET("/storage/stats", func(c *gin.Context) {
+			var recCount int64
+			var totalSize int64
+			db.Model(&Recording{}).Count(&recCount)
+			db.Model(&Recording{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize)
+
+			diskTotal, diskFree, diskUsed := getDiskStats("storage")
+			recordingsUsed := storageUsedByRecordings()
+
+			c.JSON(http.StatusOK, gin.H{
+				"recordings":       recCount,
+				"recordings_bytes": recordingsUsed,
+				"disk_total":       diskTotal,
+				"disk_free":        diskFree,
+				"disk_used":        diskUsed,
+				"db_total_size":    totalSize,
+			})
+		})
 	}
 
 	// 404 handler — always JSON
@@ -386,7 +518,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("CallSync server starting on :%s", port)
+	log.Printf("CallSync server v2.0 starting on :%s", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
