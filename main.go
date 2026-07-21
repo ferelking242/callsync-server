@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 var jwtKey = []byte("callsync_secret_security_key_2026")
@@ -128,13 +128,8 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
-func main() {
-	initDB()
-	os.MkdirAll("storage", 0755)
-
-	r := gin.Default()
-
-	r.Use(func(c *gin.Context) {
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
@@ -145,10 +140,48 @@ func main() {
 			return
 		}
 		c.Next()
+	}
+}
+
+func main() {
+	initDB()
+	os.MkdirAll("storage", 0755)
+
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery())
+	r.SetTrustedProxies(nil)
+	r.Use(corsMiddleware())
+
+	// Root — API info (browser-friendly, no more red 404)
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"app":     "CallSync Server",
+			"version": "1.0.0",
+			"status":  "running",
+			"endpoints": []string{
+				"GET  /health",
+				"POST /login",
+				"POST /upload        (Bearer token)",
+				"GET  /records       (Bearer token)",
+				"GET  /stream/:id    (Bearer token)",
+				"DELETE /record/:id  (Bearer token)",
+			},
+		})
 	})
 
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "healthy", "version": "1.0.0"})
+		var recCount int64
+		var devCount int64
+		db.Model(&Recording{}).Count(&recCount)
+		db.Model(&Device{}).Count(&devCount)
+		c.JSON(http.StatusOK, gin.H{
+			"status":      "healthy",
+			"version":     "1.0.0",
+			"recordings":  recCount,
+			"devices":     devCount,
+			"server_time": time.Now().UTC().Format(time.RFC3339),
+		})
 	})
 
 	r.POST("/login", func(c *gin.Context) {
@@ -157,7 +190,7 @@ func main() {
 			Password string `json:"password" binding:"required"`
 		}
 		if err := c.ShouldBindJSON(&input); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: username and password required"})
 			return
 		}
 
@@ -172,7 +205,11 @@ func main() {
 			return
 		}
 
-		token, _ := generateToken(user.Username)
+		token, err := generateToken(user.Username)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"token": token})
 	})
 
@@ -187,25 +224,36 @@ func main() {
 			clientSHA256 := c.PostForm("sha256")
 
 			if phoneID == "" || deviceName == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Missing phone_id or device_name"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields: phone_id and device_name"})
 				return
 			}
 
 			fileHeader, err := c.FormFile("file")
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded — include a 'file' field in multipart form"})
 				return
 			}
 
-			file, _ := fileHeader.Open()
+			file, err := fileHeader.Open()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open uploaded file"})
+				return
+			}
 			defer file.Close()
 
 			hasher := sha256.New()
-			io.Copy(hasher, file)
+			if _, err := io.Copy(hasher, file); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to compute file hash"})
+				return
+			}
 			computedSHA256 := hex.EncodeToString(hasher.Sum(nil))
 
 			if clientSHA256 != "" && clientSHA256 != computedSHA256 {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "SHA256 mismatch"})
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error":    "SHA256 mismatch — file may be corrupted",
+					"expected": clientSHA256,
+					"got":      computedSHA256,
+				})
 				return
 			}
 
@@ -214,7 +262,7 @@ func main() {
 
 			var existingRecording Recording
 			if err := db.Where("sha256 = ?", computedSHA256).First(&existingRecording).Error; err == nil {
-				c.JSON(http.StatusOK, gin.H{"message": "File already exists", "id": existingRecording.ID})
+				c.JSON(http.StatusOK, gin.H{"message": "File already exists (duplicate)", "id": existingRecording.ID})
 				return
 			}
 
@@ -223,7 +271,10 @@ func main() {
 			os.MkdirAll(deviceFolder, 0755)
 
 			targetPath := filepath.Join(deviceFolder, safeFilename)
-			c.SaveUploadedFile(fileHeader, targetPath)
+			if err := c.SaveUploadedFile(fileHeader, targetPath); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file to disk"})
+				return
+			}
 
 			creationTime := time.Now()
 			if timestampStr != "" {
@@ -241,14 +292,25 @@ func main() {
 				Path:         targetPath,
 				DeviceID:     phoneID,
 			}
-			db.Create(&recording)
+			if err := db.Create(&recording).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recording metadata"})
+				return
+			}
 
-			c.JSON(http.StatusOK, gin.H{"message": "Upload successful", "id": recording.ID})
+			c.JSON(http.StatusOK, gin.H{
+				"message": "Upload successful",
+				"id":      recording.ID,
+				"sha256":  computedSHA256,
+				"size":    fileHeader.Size,
+			})
 		})
 
 		authorized.GET("/records", func(c *gin.Context) {
 			var recordings []Recording
-			db.Preload("Device").Order("creation_date DESC").Find(&recordings)
+			if err := db.Preload("Device").Order("creation_date DESC").Find(&recordings).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recordings"})
+				return
+			}
 			c.JSON(http.StatusOK, recordings)
 		})
 
@@ -256,10 +318,31 @@ func main() {
 			id := c.Param("id")
 			var recording Recording
 			if err := db.First(&recording, id).Error; err != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found", "id": id})
 				return
 			}
-			c.Header("Content-Type", "audio/mpeg")
+
+			if _, err := os.Stat(recording.Path); os.IsNotExist(err) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Audio file missing from disk", "path": recording.Path})
+				return
+			}
+
+			ext := strings.ToLower(filepath.Ext(recording.Name))
+			contentType := "audio/mpeg"
+			switch ext {
+			case ".m4a":
+				contentType = "audio/mp4"
+			case ".wav":
+				contentType = "audio/wav"
+			case ".ogg":
+				contentType = "audio/ogg"
+			case ".amr":
+				contentType = "audio/amr"
+			case ".3gp":
+				contentType = "video/3gpp"
+			}
+
+			c.Header("Content-Type", contentType)
 			c.Header("Accept-Ranges", "bytes")
 			c.File(recording.Path)
 		})
@@ -268,19 +351,43 @@ func main() {
 			id := c.Param("id")
 			var recording Recording
 			if err := db.First(&recording, id).Error; err != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found", "id": id})
 				return
 			}
-			db.Delete(&recording)
-			os.Remove(recording.Path)
-			c.JSON(http.StatusOK, gin.H{"message": "Recording deleted successfully"})
+
+			if err := db.Delete(&recording).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete recording from database"})
+				return
+			}
+
+			if err := os.Remove(recording.Path); err != nil && !os.IsNotExist(err) {
+				log.Printf("Warning: could not remove file %s: %v", recording.Path, err)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message": "Recording deleted successfully",
+				"id":      id,
+				"name":    recording.Name,
+			})
 		})
 	}
+
+	// 404 handler — always JSON
+	r.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":  "Route not found",
+			"method": c.Request.Method,
+			"path":   c.Request.URL.Path,
+			"hint":   "GET / for available endpoints",
+		})
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	r.Run(":" + port)
+	log.Printf("CallSync server starting on :%s", port)
+	if err := r.Run(":" + port); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
 }
-
