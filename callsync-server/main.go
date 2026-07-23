@@ -82,7 +82,10 @@ func initDB() {
 	var userCount int64
 	db.Model(&User{}).Count(&userCount)
 	if userCount == 0 {
-		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+		if err != nil {
+			log.Fatalf("Failed to hash default admin password: %v", err)
+		}
 		admin := User{
 			Username:  "admin",
 			Password:  string(hashedPassword),
@@ -108,8 +111,79 @@ type tgSendDocumentResp struct {
 	} `json:"result"`
 }
 
-// backupToTelegram sends the audio file to a Telegram chat as a document.
-// Runs in a goroutine — never blocks the upload response.
+// doBackupToTelegram performs the actual Telegram upload synchronously.
+// Returns true on success. Called either in a goroutine (upload path) or
+// directly in the retry loop (sequential, rate-limited).
+func doBackupToTelegram(rec Recording, botToken, chatID string) bool {
+	f, err := os.Open(rec.Path)
+	if err != nil {
+		log.Printf("[Telegram backup] cannot open %s: %v", rec.Path, err)
+		return false
+	}
+	defer f.Close()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	_ = w.WriteField("chat_id", chatID)
+	caption := fmt.Sprintf(
+		"📞 *%s*\n📱 Device: %s\n📅 %s\n💾 %.1f KB\n🔑 `%s`",
+		rec.Name,
+		rec.DeviceID,
+		rec.CreationDate.Format("2006-01-02 15:04"),
+		float64(rec.Size)/1024,
+		rec.SHA256[:16],
+	)
+	_ = w.WriteField("caption", caption)
+	_ = w.WriteField("parse_mode", "Markdown")
+
+	part, err := w.CreateFormFile("document", rec.Name)
+	if err != nil {
+		log.Printf("[Telegram backup] multipart create error: %v", err)
+		return false
+	}
+	if _, err = io.Copy(part, f); err != nil {
+		log.Printf("[Telegram backup] copy error: %v", err)
+		return false
+	}
+	w.Close()
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
+	resp, err := http.Post(url, w.FormDataContentType(), &buf)
+	if err != nil {
+		log.Printf("[Telegram backup] HTTP error: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	var tgResp tgSendDocumentResp
+	if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
+		log.Printf("[Telegram backup] decode error: %v", err)
+		return false
+	}
+
+	if !tgResp.OK {
+		log.Printf("[Telegram backup] Telegram API error for recording %d", rec.ID)
+		return false
+	}
+
+	fileID := tgResp.Result.Document.FileID
+	if fileID == "" {
+		fileID = tgResp.Result.Audio.FileID
+	}
+
+	db.Model(&Recording{}).Where("id = ?", rec.ID).Updates(map[string]interface{}{
+		"telegram_msg_id":  tgResp.Result.MessageID,
+		"telegram_file_id": fileID,
+		"telegram_backed":  true,
+	})
+
+	log.Printf("[Telegram backup] ✅ Recording %d (%s) backed up — msg_id=%d",
+		rec.ID, rec.Name, tgResp.Result.MessageID)
+	return true
+}
+
+// backupToTelegram sends the audio file to Telegram asynchronously (non-blocking upload path).
 // Requires env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 func backupToTelegram(recording *Recording) {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -117,81 +191,14 @@ func backupToTelegram(recording *Recording) {
 	if botToken == "" || chatID == "" {
 		return // Telegram backup not configured — silently skip
 	}
-
-	go func(rec Recording) {
-		f, err := os.Open(rec.Path)
-		if err != nil {
-			log.Printf("[Telegram backup] cannot open %s: %v", rec.Path, err)
-			return
-		}
-		defer f.Close()
-
-		var buf bytes.Buffer
-		w := multipart.NewWriter(&buf)
-
-		// chat_id
-		_ = w.WriteField("chat_id", chatID)
-		// caption with metadata
-		caption := fmt.Sprintf(
-			"📞 *%s*\n📱 Device: %s\n📅 %s\n💾 %.1f KB\n🔑 `%s`",
-			rec.Name,
-			rec.DeviceID,
-			rec.CreationDate.Format("2006-01-02 15:04"),
-			float64(rec.Size)/1024,
-			rec.SHA256[:16],
-		)
-		_ = w.WriteField("caption", caption)
-		_ = w.WriteField("parse_mode", "Markdown")
-
-		// file
-		part, err := w.CreateFormFile("document", rec.Name)
-		if err != nil {
-			log.Printf("[Telegram backup] multipart create error: %v", err)
-			return
-		}
-		if _, err = io.Copy(part, f); err != nil {
-			log.Printf("[Telegram backup] copy error: %v", err)
-			return
-		}
-		w.Close()
-
-		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
-		resp, err := http.Post(url, w.FormDataContentType(), &buf)
-		if err != nil {
-			log.Printf("[Telegram backup] HTTP error: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		var tgResp tgSendDocumentResp
-		if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
-			log.Printf("[Telegram backup] decode error: %v", err)
-			return
-		}
-
-		if !tgResp.OK {
-			log.Printf("[Telegram backup] Telegram API error for recording %d", rec.ID)
-			return
-		}
-
-		fileID := tgResp.Result.Document.FileID
-		if fileID == "" {
-			fileID = tgResp.Result.Audio.FileID
-		}
-
-		// Persist Telegram metadata back to DB
-		db.Model(&Recording{}).Where("id = ?", rec.ID).Updates(map[string]interface{}{
-			"telegram_msg_id":  tgResp.Result.MessageID,
-			"telegram_file_id": fileID,
-			"telegram_backed":  true,
-		})
-
-		log.Printf("[Telegram backup] ✅ Recording %d (%s) backed up — msg_id=%d",
-			rec.ID, rec.Name, tgResp.Result.MessageID)
-	}(*recording)
+	rec := *recording // copy so goroutine has its own value
+	go func() {
+		doBackupToTelegram(rec, botToken, chatID)
+	}()
 }
 
 // retryTelegramBackups retries any recording that wasn't backed up yet.
+// Runs sequentially with a 2-second delay between each to avoid Telegram flood limits.
 // Called at server start and every 10 minutes.
 func retryTelegramBackups() {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -201,7 +208,7 @@ func retryTelegramBackups() {
 	}
 
 	go func() {
-		// Wait a bit for the server to fully start before first retry
+		// Wait for the server to fully start before first retry
 		time.Sleep(30 * time.Second)
 		for {
 			var pending []Recording
@@ -209,8 +216,10 @@ func retryTelegramBackups() {
 			if len(pending) > 0 {
 				log.Printf("[Telegram backup] Retrying %d un-backed recordings…", len(pending))
 				for i := range pending {
-					backupToTelegram(&pending[i])
-					time.Sleep(2 * time.Second) // Rate limit: avoid Telegram flood
+					// Sequential + rate-limited: wait for each upload to finish
+					// before starting the next to avoid flooding Telegram.
+					doBackupToTelegram(pending[i], botToken, chatID)
+					time.Sleep(2 * time.Second)
 				}
 			}
 			time.Sleep(10 * time.Minute)
@@ -456,7 +465,13 @@ func main() {
 			}
 
 			safeFilename := filepath.Base(fileHeader.Filename)
+			// Guard against path traversal: ensure the resolved folder stays inside storage/
 			deviceFolder := filepath.Join("storage", filepath.Clean(phoneID))
+			if !strings.HasPrefix(filepath.Clean(deviceFolder), "storage"+string(filepath.Separator)) &&
+				filepath.Clean(deviceFolder) != "storage" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid phone_id"})
+				return
+			}
 			os.MkdirAll(deviceFolder, 0755)
 
 			targetPath := filepath.Join(deviceFolder, safeFilename)

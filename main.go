@@ -21,7 +21,13 @@ import (
 	"gorm.io/gorm"
 )
 
-var jwtKey = []byte("callsync_secret_security_key_2026")
+var jwtKey = func() []byte {
+	if secret := os.Getenv("SESSION_SECRET"); secret != "" {
+		return []byte(secret)
+	}
+	log.Println("WARNING: SESSION_SECRET not set — using insecure fallback JWT key. Set SESSION_SECRET in production!")
+	return []byte("callsync_secret_security_key_2026")
+}()
 
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
@@ -67,7 +73,10 @@ func initDB() {
 	var userCount int64
 	db.Model(&User{}).Count(&userCount)
 	if userCount == 0 {
-		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+		if err != nil {
+			log.Fatalf("Failed to hash default admin password: %v", err)
+		}
 		admin := User{
 			Username:  "admin",
 			Password:  string(hashedPassword),
@@ -298,7 +307,13 @@ func main() {
 			}
 
 			safeFilename := filepath.Base(fileHeader.Filename)
+			// Guard against path traversal: ensure the resolved folder stays inside storage/
 			deviceFolder := filepath.Join("storage", filepath.Clean(phoneID))
+			if !strings.HasPrefix(filepath.Clean(deviceFolder), "storage"+string(filepath.Separator)) &&
+				filepath.Clean(deviceFolder) != "storage" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid phone_id"})
+				return
+			}
 			os.MkdirAll(deviceFolder, 0755)
 
 			targetPath := filepath.Join(deviceFolder, safeFilename)
