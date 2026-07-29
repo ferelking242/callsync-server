@@ -68,6 +68,16 @@ type DeleteCommand struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ClientDownload tracks every file a Flutter client has downloaded.
+// Files are removed from the Recording table and disk after download,
+// but their SHA256 is kept here so the Kotlin recorder can skip re-uploads.
+type ClientDownload struct {
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	SHA256       string    `gorm:"index;not null" json:"sha256"`
+	Name         string    `gorm:"not null" json:"name"`
+	DownloadedAt time.Time `json:"downloaded_at"`
+}
+
 var db *gorm.DB
 
 // sha256Hex returns the hex-encoded SHA-256 of a string.
@@ -84,7 +94,7 @@ func initDB() {
 	if err != nil {
 		log.Fatalf("Failed to connect to SQLite database: %v", err)
 	}
-	if err = db.AutoMigrate(&User{}, &Device{}, &Recording{}, &DeleteCommand{}); err != nil {
+	if err = db.AutoMigrate(&User{}, &Device{}, &Recording{}, &DeleteCommand{}, &ClientDownload{}); err != nil {
 		log.Fatalf("Database migration failed: %v", err)
 	}
 
@@ -233,7 +243,7 @@ func pathSuffix(r *http.Request, prefix string) string {
 func handleRoot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"app":     "CallSync Server",
-		"version": "2.2.0",
+		"version": "2.3.0",
 		"status":  "running",
 		"endpoints": []string{
 			"GET    /",
@@ -243,7 +253,8 @@ func handleRoot(w http.ResponseWriter, _ *http.Request) {
 			"GET    /records             (Bearer token)",
 			"GET    /record/{id}         (Bearer token)",
 			"GET    /stream/{id}         (Bearer token)",
-			"GET    /download/{id}       (Bearer token)",
+			"GET    /download/{id}       (Bearer token) — serve + auto-delete from server",
+			"GET    /known-hashes        (Bearer token) — all known SHA256s for dedup",
 			"DELETE /record/{id}         (Bearer token)",
 			"DELETE /purge-all           (Bearer token)",
 			"GET    /storage/stats       (Bearer token)",
@@ -254,15 +265,17 @@ func handleRoot(w http.ResponseWriter, _ *http.Request) {
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	var recCount, devCount int64
+	var recCount, devCount, dlCount int64
 	db.Model(&Recording{}).Count(&recCount)
 	db.Model(&Device{}).Count(&devCount)
+	db.Model(&ClientDownload{}).Count(&dlCount)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "healthy",
-		"version":     "2.2.0",
-		"recordings":  recCount,
-		"devices":     devCount,
-		"server_time": time.Now().UTC().Format(time.RFC3339),
+		"status":             "healthy",
+		"version":            "2.3.0",
+		"recordings":         recCount,
+		"devices":            devCount,
+		"client_downloads":   dlCount,
+		"server_time":        time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -454,6 +467,9 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, rec.Path)
 }
 
+// handleDownload serves the file, records the download in ClientDownload,
+// removes it from the Recording table, and deletes the physical file afterward.
+// This keeps the server clean: files are ephemeral and exist only until a client downloads them.
 func handleDownload(w http.ResponseWriter, r *http.Request) {
 	id := pathSuffix(r, "/download/")
 	var rec Recording
@@ -461,13 +477,61 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Recording not found"})
 		return
 	}
-	if _, err := os.Stat(rec.Path); os.IsNotExist(err) {
+
+	f, err := os.Open(rec.Path)
+	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Audio file missing from disk"})
 		return
 	}
+	defer f.Close()
+
+	// Persist the download record before touching the DB/file so we never lose the SHA256
+	db.Create(&ClientDownload{SHA256: rec.SHA256, Name: rec.Name, DownloadedAt: time.Now()})
+
+	// Remove from Recording table — file is no longer "on server"
+	db.Delete(&rec)
+
+	// Stream the file to the client
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, rec.Name))
+	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Transfer-Encoding", "binary")
-	http.ServeFile(w, r, rec.Path)
+	filePath := rec.Path
+	io.Copy(w, f) //nolint:errcheck — best-effort; client connection may drop
+	f.Close()
+
+	// Delete physical file after bytes are written to the response buffer
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: could not remove downloaded file %s: %v", filePath, err)
+	}
+}
+
+// handleKnownHashes returns all SHA256 hashes the server knows about:
+// files currently on server (Recording) + files already downloaded by Flutter clients (ClientDownload).
+// The Kotlin recorder calls this before each upload batch to skip files already in the pipeline.
+func handleKnownHashes(w http.ResponseWriter, _ *http.Request) {
+	var serverHashes []string
+	db.Model(&Recording{}).Pluck("sha256", &serverHashes)
+
+	var clientHashes []string
+	db.Model(&ClientDownload{}).Pluck("sha256", &clientHashes)
+
+	// Deduplicate (a file could be in both if downloaded immediately after upload)
+	seen := make(map[string]struct{}, len(serverHashes)+len(clientHashes))
+	for _, h := range serverHashes {
+		seen[h] = struct{}{}
+	}
+	for _, h := range clientHashes {
+		seen[h] = struct{}{}
+	}
+	combined := make([]string, 0, len(seen))
+	for h := range seen {
+		combined = append(combined, h)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sha256_list": combined,
+		"count":       len(combined),
+	})
 }
 
 func handleDeleteRecord(w http.ResponseWriter, r *http.Request) {
@@ -662,6 +726,7 @@ func main() {
 
 	mux.HandleFunc("/stream/", only(http.MethodGet, auth(handleStream)))
 	mux.HandleFunc("/download/", only(http.MethodGet, auth(handleDownload)))
+	mux.HandleFunc("/known-hashes", only(http.MethodGet, auth(handleKnownHashes)))
 	mux.HandleFunc("/purge-all", only(http.MethodDelete, auth(handlePurgeAll)))
 	mux.HandleFunc("/storage/stats", only(http.MethodGet, auth(handleStorageStats)))
 	mux.HandleFunc("/delete-commands", only(http.MethodPost, auth(handlePostDeleteCommands)))
