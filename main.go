@@ -609,6 +609,22 @@ func handleGetDeleteCommands(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// only wraps a handler to enforce a single HTTP method (Go 1.21 compatible).
+// OPTIONS is always allowed for CORS preflight.
+func only(method string, h handler) handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			cors(func(w http.ResponseWriter, _ *http.Request) {})(w, r)
+			return
+		}
+		if r.Method != method {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		h(w, r)
+	}
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -617,17 +633,18 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Public routes
+	// Public routes — path-only registration (Go 1.21 compatible)
 	mux.HandleFunc("/", cors(handleRoot))
-	mux.HandleFunc("GET /health", cors(handleHealth))
-	mux.HandleFunc("POST /login", cors(handleLogin))
+	mux.HandleFunc("/health", cors(only(http.MethodGet, handleHealth)))
+	mux.HandleFunc("/login", cors(only(http.MethodPost, handleLogin)))
 
 	// GET /delete-commands/{device_id} — no auth (Kotlin poller)
-	mux.HandleFunc("GET /delete-commands/", cors(handleGetDeleteCommands))
+	// NOTE: must be registered before /delete-commands (exact vs prefix)
+	mux.HandleFunc("/delete-commands/", cors(only(http.MethodGet, handleGetDeleteCommands)))
 
 	// Protected routes
-	mux.HandleFunc("POST /upload", auth(handleUpload))
-	mux.HandleFunc("GET /records", auth(handleRecords))
+	mux.HandleFunc("/upload", only(http.MethodPost, auth(handleUpload)))
+	mux.HandleFunc("/records", only(http.MethodGet, auth(handleRecords)))
 
 	// /record/{id} — GET and DELETE
 	mux.HandleFunc("/record/", func(w http.ResponseWriter, r *http.Request) {
@@ -643,11 +660,11 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("GET /stream/", auth(handleStream))
-	mux.HandleFunc("GET /download/", auth(handleDownload))
-	mux.HandleFunc("DELETE /purge-all", auth(handlePurgeAll))
-	mux.HandleFunc("GET /storage/stats", auth(handleStorageStats))
-	mux.HandleFunc("POST /delete-commands", auth(handlePostDeleteCommands))
+	mux.HandleFunc("/stream/", only(http.MethodGet, auth(handleStream)))
+	mux.HandleFunc("/download/", only(http.MethodGet, auth(handleDownload)))
+	mux.HandleFunc("/purge-all", only(http.MethodDelete, auth(handlePurgeAll)))
+	mux.HandleFunc("/storage/stats", only(http.MethodGet, auth(handleStorageStats)))
+	mux.HandleFunc("/delete-commands", only(http.MethodPost, auth(handlePostDeleteCommands)))
 
 	port := os.Getenv("PORT")
 	if port == "" {
