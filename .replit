@@ -1,4 +1,7 @@
-modules = ["go-1.21"]
+modules = ["go-1.25"]
+
+[nix]
+channel = "stable-25_05"
 
 [workflows]
 runButton = "Project"
@@ -10,15 +13,19 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "CallSync Server"
+args = "Start application"
 
 [[workflows.workflow]]
-name = "CallSync Server"
+name = "Start application"
 author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd /home/runner/workspace/callsync-server && go build -o callsync-bin . && ./callsync-bin"
+args = "go build -mod=vendor -o callsync-bin . && ./callsync-bin"
+waitForPort = 8080
 
 [[ports]]
 localPort = 8080
@@ -26,5 +33,5 @@ externalPort = 80
 
 [deployment]
 deploymentTarget = "vm"
-run = ["sh", "-c", "cd /home/runner/workspace/callsync-server && go build -o /tmp/callsync-bin . && /tmp/callsync-bin"]
-build = ["sh", "-c", "echo 'no separate build step'"]
+run = ["./callsync-bin"]
+build = ["go", "build", "-mod=vendor", "-o", "callsync-bin", "."]

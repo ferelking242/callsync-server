@@ -1,0 +1,5 @@
+callsync-bin
+callsync_server
+callsync-server
+*.db
+storage/
