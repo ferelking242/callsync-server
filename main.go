@@ -12,11 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/glebarez/sqlite"
+	"github.com/golang-jwt/jwt/v5"
 	"gorm.io/gorm"
 )
 
@@ -79,6 +80,28 @@ type ClientDownload struct {
 }
 
 var db *gorm.DB
+
+// The relay is deliberately process-local and memory-only. It is a rendezvous
+// channel for two already-paired devices; recordings are never written to the
+// server and are discarded after each response.
+type relayRequest struct {
+	ID      string
+	Request map[string]any
+}
+
+type relaySource struct {
+	secret   string
+	requests chan relayRequest
+}
+
+var relayHub = struct {
+	sync.Mutex
+	sources map[string]*relaySource
+	pending map[string]chan map[string]any
+}{
+	sources: make(map[string]*relaySource),
+	pending: make(map[string]chan map[string]any),
+}
 
 // sha256Hex returns the hex-encoded SHA-256 of a string.
 func sha256Hex(s string) string {
@@ -260,6 +283,10 @@ func handleRoot(w http.ResponseWriter, _ *http.Request) {
 			"GET    /storage/stats       (Bearer token)",
 			"POST   /delete-commands     (Bearer token) — queue source-delete commands",
 			"GET    /delete-commands/{device_id} — polled by Kotlin recorder",
+			"POST   /p2p/source/register — register a source for memory-only relay",
+			"GET    /p2p/source/poll — long-poll relay commands",
+			"POST   /p2p/source/respond — return a relay response",
+			"POST   /p2p/client/request — send a command through the relay",
 		},
 	})
 }
@@ -270,12 +297,12 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	db.Model(&Device{}).Count(&devCount)
 	db.Model(&ClientDownload{}).Count(&dlCount)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":             "healthy",
-		"version":            "2.3.0",
-		"recordings":         recCount,
-		"devices":            devCount,
-		"client_downloads":   dlCount,
-		"server_time":        time.Now().UTC().Format(time.RFC3339),
+		"status":           "healthy",
+		"version":          "2.3.0",
+		"recordings":       recCount,
+		"devices":          devCount,
+		"client_downloads": dlCount,
+		"server_time":      time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -673,6 +700,136 @@ func handleGetDeleteCommands(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── Memory-only P2P relay ─────────────────────────────────────────────────────
+
+func relaySourceFor(id, secret string) (*relaySource, bool) {
+	relayHub.Lock()
+	defer relayHub.Unlock()
+	source, ok := relayHub.sources[id]
+	return source, ok && source.secret == secret
+}
+
+func handleRelaySourceRegister(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SourceID string `json:"source_id"`
+		Secret   string `json:"secret"`
+	}
+	if err := readJSON(r, &input); err != nil || input.SourceID == "" || input.Secret == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source_id and secret required"})
+		return
+	}
+	relayHub.Lock()
+	if source, exists := relayHub.sources[input.SourceID]; exists {
+		if source.secret != input.Secret {
+			relayHub.Unlock()
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid relay capability"})
+			return
+		}
+	} else {
+		relayHub.sources[input.SourceID] = &relaySource{
+			secret: input.Secret, requests: make(chan relayRequest, 16),
+		}
+	}
+	relayHub.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "memory-relay"})
+}
+
+func handleRelaySourcePoll(w http.ResponseWriter, r *http.Request) {
+	source, ok := relaySourceFor(r.URL.Query().Get("source_id"), r.URL.Query().Get("secret"))
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "source is not registered"})
+		return
+	}
+	select {
+	case request := <-source.requests:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "request_id": request.ID, "request": request.Request,
+		})
+	case <-time.After(30 * time.Second):
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "empty": true})
+	case <-r.Context().Done():
+		return
+	}
+}
+
+func handleRelayClientRequest(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SourceID string         `json:"source_id"`
+		Secret   string         `json:"secret"`
+		Request  map[string]any `json:"request"`
+	}
+	if err := readJSON(r, &input); err != nil ||
+		input.SourceID == "" || input.Secret == "" || input.Request == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relay request"})
+		return
+	}
+	source, ok := relaySourceFor(input.SourceID, input.Secret)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "source offline"})
+		return
+	}
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	response := make(chan map[string]any, 1)
+	relayHub.Lock()
+	relayHub.pending[id] = response
+	relayHub.Unlock()
+	defer func() {
+		relayHub.Lock()
+		delete(relayHub.pending, id)
+		relayHub.Unlock()
+	}()
+
+	select {
+	case source.requests <- relayRequest{ID: id, Request: input.Request}:
+	case <-r.Context().Done():
+		return
+	}
+
+	timer := time.NewTimer(125 * time.Second)
+	defer timer.Stop()
+	select {
+	case payload := <-response:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "response": payload})
+	case <-timer.C:
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "source response timeout"})
+	case <-r.Context().Done():
+		return
+	}
+}
+
+func handleRelaySourceRespond(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SourceID  string         `json:"source_id"`
+		Secret    string         `json:"secret"`
+		RequestID string         `json:"request_id"`
+		Response  map[string]any `json:"response"`
+	}
+	if err := readJSON(r, &input); err != nil ||
+		input.SourceID == "" || input.Secret == "" ||
+		input.RequestID == "" || input.Response == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relay response"})
+		return
+	}
+	if _, ok := relaySourceFor(input.SourceID, input.Secret); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid relay capability"})
+		return
+	}
+	relayHub.Lock()
+	response, ok := relayHub.pending[input.RequestID]
+	relayHub.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "relay request expired"})
+		return
+	}
+	select {
+	case response <- input.Response:
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		writeJSON(w, http.StatusGone, map[string]string{"error": "relay response already received"})
+	}
+}
+
 // only wraps a handler to enforce a single HTTP method (Go 1.21 compatible).
 // OPTIONS is always allowed for CORS preflight.
 func only(method string, h handler) handler {
@@ -705,6 +862,10 @@ func main() {
 	// GET /delete-commands/{device_id} — no auth (Kotlin poller)
 	// NOTE: must be registered before /delete-commands (exact vs prefix)
 	mux.HandleFunc("/delete-commands/", cors(only(http.MethodGet, handleGetDeleteCommands)))
+	mux.HandleFunc("/p2p/source/register", cors(only(http.MethodPost, handleRelaySourceRegister)))
+	mux.HandleFunc("/p2p/source/poll", cors(only(http.MethodGet, handleRelaySourcePoll)))
+	mux.HandleFunc("/p2p/source/respond", cors(only(http.MethodPost, handleRelaySourceRespond)))
+	mux.HandleFunc("/p2p/client/request", cors(only(http.MethodPost, handleRelayClientRequest)))
 
 	// Protected routes
 	mux.HandleFunc("/upload", only(http.MethodPost, auth(handleUpload)))
